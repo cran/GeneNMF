@@ -9,7 +9,9 @@ getDataMatrix(
   assay = "RNA",
   slot = "data",
   hvg = NULL,
-  do_centering = TRUE
+  center = FALSE,
+  scale = FALSE,
+  non_negative = TRUE
 )
 }
 \arguments{
@@ -22,7 +24,11 @@ getDataMatrix(
 \item{hvg}{List of variable genes to subset the matrix. If NULL, uses
 all genes}
 
-\item{do_centering}{Whether to center the data matrix}
+\item{center}{Whether to center the data matrix}
+
+\item{scale}{Whether to scale the data matrix}
+
+\item{non_negative}{Enforce non-negative values for NMF}
 }
 \value{
 Returns a sparse data matrix (cells per genes), subset 

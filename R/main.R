@@ -10,7 +10,8 @@
 #' @param hvg List of pre-calculated variable genes to subset the matrix.
 #'     If hvg=NULL it calculates them automatically
 #' @param nfeatures Number of HVG, if calculate_hvg=TRUE
-#' @param do_centering Whether to center the data matrix
+#' @param center Whether to center the data matrix
+#' @param scale Whether to scale the data matrix
 #' @param hvg.blocklist Optionally takes a vector or list of vectors of gene
 #'     names. These genes will be ignored for HVG detection. This is useful
 #'     to mitigateeffect of genes associated with technical artifacts and
@@ -38,7 +39,8 @@
 #' @export  
 multiNMF <- function(obj.list, assay="RNA", slot="data", k=5:6,
                    hvg=NULL, nfeatures = 2000, L1=c(0,0),
-                   min.exp=0.01, max.exp=3.0, do_centering=TRUE,
+                   min.exp=0.01, max.exp=3.0,
+                   center=FALSE, scale=FALSE,
                    min.cells.per.sample = 10,
                    hvg.blocklist=NULL, seed=123) {
   
@@ -57,7 +59,8 @@ multiNMF <- function(obj.list, assay="RNA", slot="data", k=5:6,
   nmf.res <- lapply(obj.list, function(this) {
     
     mat <- getDataMatrix(obj=this, assay=assay, slot=slot,
-                      hvg=hvg, do_centering=do_centering)
+                      hvg=hvg, center=center,
+                      scale=scale)
     
     res.k <- lapply(k, function(k.this) {
       
@@ -77,16 +80,99 @@ multiNMF <- function(obj.list, assay="RNA", slot="data", k=5:6,
   return(nmf.res)
 }  
 
+#' Run PCA on a list of Seurat objects
+#'
+#' Given a list of Seurat objects, run non-negative PCA factorization on 
+#' each sample individually.
+#'
+#' @param obj.list A list of Seurat objects
+#' @param k Number of target components for PCA
+#' @param assay Get data matrix from this assay
+#' @param slot Get data matrix from this slot (=layer)
+#' @param hvg List of pre-calculated variable genes to subset the matrix.
+#'     If hvg=NULL it calculates them automatically
+#' @param nfeatures Number of HVG, if calculate_hvg=TRUE
+#' @param center Whether to center the data matrix
+#' @param scale Whether to scale the data matrix
+#' @param hvg.blocklist Optionally takes a vector or list of vectors of gene
+#'     names. These genes will be ignored for HVG detection. This is useful
+#'     to mitigateeffect of genes associated with technical artifacts and
+#'     batch effects (e.g. mitochondrial), and to exclude TCR and BCR 
+#'     adaptive immune(clone-specific) receptors. If set to `NULL` no genes 
+#'     will be excluded
+#' @param min.cells.per.sample Minimum numer of cells per sample (smaller 
+#'     samples will be ignored)
+#' @param min.exp Minimum average log-expression value for retaining genes
+#' @param max.exp Maximum average log-expression value for retaining genes
+
+#' @param seed Random seed     
+#'     
+#' @return Returns a list of non-negative PCA programs, one for each sample.
+#'     The format of each program in the list follows the
+#'     structure of \code{\link[RcppML]{nmf}} factorization models.
+#'
+#' @examples
+#' library(Seurat)
+#' data(sampleObj)
+#' geneNMF_programs <- multiPCA(list(sampleObj), k=5)
+#' 
+#' @importFrom irlba prcomp_irlba
+#' @export  
+
+multiPCA <- function(obj.list, assay="RNA", slot="data", k=4:5,
+                     hvg=NULL, nfeatures = 500,
+                     min.exp=0.01, max.exp=3.0,
+                     min.cells.per.sample = 10,
+                     center=FALSE, scale=FALSE,
+                     hvg.blocklist=NULL, seed=123) {
+  
+  set.seed(seed)
+  
+  #exclude small samples
+  nc <- lapply(obj.list, ncol)
+  obj.list <- obj.list[nc > min.cells.per.sample]
+  
+  if (is.null(hvg)) {
+    hvg <- findHVG(obj.list, nfeatures=nfeatures,
+                             min.exp=min.exp, max.exp=max.exp, hvg.blocklist=hvg.blocklist)
+  }
+  
+  #run PCA by sample
+  pca.res <- lapply(obj.list, function(this) {
+    
+    mat <- getDataMatrix(obj=this, assay=assay, slot=slot,
+                                   hvg=hvg, center=center,
+                                   scale=scale, non_negative = FALSE)
+    res.k <- lapply(k, function(k.this) {
+      
+      pca <- prcomp_irlba(t(as.matrix(mat)), center=F, scale.=F, n=k.this)
+      rownames(pca$rotation) <- rownames(mat)
+      
+      nn_pca <- nonNegativePCA(pca, k=k.this) 
+      
+      npca.obj <- list(w = nn_pca, h = NULL)
+      npca.obj
+    })
+    names(res.k) <- paste0("k",k)
+    res.k
+  })
+  pca.res <- unlist(pca.res, recursive = FALSE)
+  
+  return(pca.res)
+}  
+
+
 #' Get list of genes for each NMF program
 #'
 #' Run it over a list of NMF models obtained using \code{multiNMF()}
 #'
 #' @param nmf.res A list of NMF models obtained using \code{multiNMF()}
-#' @param method Parameter passed to \code{\link[NMF]{extractFeatures}} to
-#'     obtain top genes for each program. When 'method' is a number between 0 
-#'     and 1, it indicates
-#'     the minimum relative basis contribution above which the feature is
-#'     selected, i.e. how specific is a gene for a given program.
+#' @param specificity.weight A parameter controlling how specific gene
+#'     should be for each program. `specificity.weight=0` no constraint on
+#'     specificity, and positive values impose increasing specificity.
+#' @param weight.explained Fraction of NMF weights explained by selected
+#'     genes. For example if weight.explained=0.5, all genes that together
+#'     account for 50\% of NMF weights are used to return program signatures.
 #' @param max.genes Max number of genes for each program 
 #'     
 #' @return Returns a list of top genes for each gene program found
@@ -98,28 +184,41 @@ multiNMF <- function(obj.list, assay="RNA", slot="data", k=5:6,
 #' geneNMF_programs <- multiNMF(list(sampleObj), k=5)
 #' geneNMF_genes <- getNMFgenes(geneNMF_programs)
 #' 
-#' @importFrom NMF extractFeatures
-#' @export  
-getNMFgenes <- function(nmf.res, method=0.5, max.genes=200) {
+#' @importFrom utils head
+#' @export
+  
+getNMFgenes <- function(nmf.res,
+                        specificity.weight=5,
+                        weight.explained=0.5,
+                        max.genes=200) {
+  
+  
+  if (!is.null(specificity.weight)) {
+    nmf.res <- weightedLoadings(nmf.res, specificity.weight=specificity.weight)
+  }
   
   nmf.genes <- lapply(nmf.res, function(model) {
     
-    emb <- model$h
-    load <- model$w
-    
-    m <- NMF::extractFeatures(load, method=method)
-    m <- lapply(m, function(x){
-      genes <- rownames(load)[x]
-      head(genes, min(length(genes), max.genes))
+    gene.pass <- apply(model, 2, function(x) {
+      weightCumul(x, weight.explained = weight.explained)
     })
     
-    names(m) <- paste0("p",seq(1,length(m)))
+    m <- lapply(gene.pass, function(g) {
+      head(g, min(length(g), max.genes))
+    })
+    
+    #drop empty programs
+    isna <- lapply(m, function(x) {all(is.na(x))})
+    m <- m[!as.numeric(isna)]
+    
+    names(m) <- seq(1,length(m))
     m
   })
   
   nmf.genes <- unlist(nmf.genes, recursive = FALSE)
   return(nmf.genes)
 }
+
 #' Extract consensus gene programs (meta-programs)
 #'
 #' Run it over a list of NMF models obtained using \code{\link{multiNMF}}; it will 
@@ -127,11 +226,16 @@ getNMFgenes <- function(nmf.res, method=0.5, max.genes=200) {
 #' and values of k.
 #'
 #' @param nmf.res A list of NMF models obtained from \code{\link{multiNMF}}
-#' @param method Parameter passed to \code{\link[NMF]{extractFeatures}} to 
-#'     obtain top genes for each program
+#' @param nMP Total number of meta-programs
+#' @param metric Metric to calculate pairwise similarity between programs     
 #' @param max.genes Max number of genes for each programs
 #' @param hclust.method Method to build similarity tree between individual programs
-#' @param nprograms Total number of meta-programs
+#' @param specificity.weight A parameter controlling how specific gene
+#'     should be for each program. `specificity.weight=0` no constraint on
+#'     specificity, and positive values impose increasing specificity.
+#' @param weight.explained Fraction of NMF weights explained by selected
+#'     genes. For example if weight.explained=0.5, all genes that together
+#'     account for 50\% of NMF weights are used to return program signatures.
 #' @param min.confidence Percentage of programs in which a gene is seen 
 #'      (out of programs in the corresponding program tree branch/cluster), to be 
 #'      retained in the consensus metaprograms
@@ -140,9 +244,9 @@ getNMFgenes <- function(nmf.res, method=0.5, max.genes=200) {
 #' @return Returns a list with i) 'metaprograms.genes' top genes for each 
 #'     meta-program; ii) 'metaprograms.metrics' dataframe with meta-programs 
 #'     statistics: a) freq. of samples where the MP is present, b) average 
-#'     silhouette width, c) mean Jaccard similarity, d) number of genes in MP, 
-#'     e) number of gene programs in MP; iii) 'programs.jaccard': matrix of 
-#'     Jaccard similarities between meta-programs; iv) 'programs.tree': 
+#'     silhouette width, c) mean similarity (cosine or Jaccard), d) number of genes in MP, 
+#'     e) number of gene programs in MP; iii) 'programs.similarity': matrix of 
+#'     similarities (Jaccard or cosine) between meta-programs; iv) 'programs.tree': 
 #'     hierarchical clustering of meta-programs (hclust tree); v) 
 #'     'programs.clusters': meta-program identity for each program
 #'
@@ -150,41 +254,49 @@ getNMFgenes <- function(nmf.res, method=0.5, max.genes=200) {
 #' library(Seurat)
 #' data(sampleObj)
 #' geneNMF_programs <- multiNMF(list(sampleObj), k=5)
-#' geneNMF_metaprograms <- getMetaPrograms(geneNMF_programs, nprograms=3)
+#' geneNMF_metaprograms <- getMetaPrograms(geneNMF_programs, nMP=3)
 #' 
-#' @importFrom NMF extractFeatures
-#' @importFrom stats cutree dist
+#' @importFrom stats cutree dist as.dist hclust
 #' @importFrom cluster silhouette
+#' @importFrom lsa cosine
+#' @importFrom utils head
 #' @export  
-getMetaPrograms <- function(nmf.res, method=0.5,
+getMetaPrograms <- function(nmf.res,
+                            nMP=10,
+                            specificity.weight=5,
+                            weight.explained=0.5,
                             max.genes=200,
+                            metric = c("cosine","jaccard"),
                             hclust.method="ward.D2",
-                            nprograms=10,
-                            min.confidence=0.2,
+                            min.confidence=0.5,
                             remove.empty=TRUE) {
   
-  nmf.genes <- getNMFgenes(nmf.res=nmf.res, method=method, max.genes=max.genes) 
+  metric = metric[1]
   
-  nprogs <- length(nmf.genes)
-  J <- matrix(data=0, ncol=nprogs, nrow = nprogs)
-  colnames(J) <- names(nmf.genes)
-  rownames(J) <- names(nmf.genes)
+  nmf.wgt <- weightedLoadings(nmf.res=nmf.res,
+                           specificity.weight=specificity.weight)
   
-  for (i in 1:nprogs) {
-    for (j in 1:nprogs) {
-      J[i,j] <- jaccardIndex(nmf.genes[[i]], nmf.genes[[j]])
-    }  
+  if (metric == "cosine") {
+    J <- cosineSimilarity(geneList2table(nmf.wgt))  
+  } else if (metric == "jaccard") {
+    nmf.genes <- getNMFgenes(nmf.res=nmf.wgt,
+                             specificity.weight=NULL, #because it was precalculated
+                             weight.explained=weight.explained,
+                             max.genes=max.genes) 
+    J <- jaccardSimilarity(nmf.genes)
+  } else {
+    stop("Unknown distance metric.")
   }
   Jdist <- as.dist(1-J)
-  
-  #Cluster programs by gene overlap (J index)
+  #Cluster programs by gene overlap
   tree <- hclust(Jdist, method=hclust.method)
-  cl_members <- cutree(tree, k = nprograms)
+  cl_members <- cutree(tree, k = nMP)
   
   #Get consensus markers for MPs
-  markers.consensus <- get_metaprogram_consensus(nmf.genes=nmf.genes,
-                                                 nprograms=nprograms,
+  markers.consensus <- get_metaprogram_consensus(nmf.wgt=nmf.wgt,
+                                                 nMP=nMP,
                                                  min.confidence=min.confidence,
+                                                 weight.explained=weight.explained,
                                                  max.genes=max.genes,
                                                  cl_members=cl_members)
   #Get meta-program metrics
@@ -220,10 +332,15 @@ getMetaPrograms <- function(nmf.res, method=0.5,
 
   names(cl_members.new) <- names(cl_members)
   
+  #weights of individual genes in each MP
+  markers.consensus <- lapply(markers.consensus, function(m){m/sum(m)})
+  markers.genes <- lapply(markers.consensus, names)
+  
   output.object <- list()
-  output.object[["metaprograms.genes"]] <- markers.consensus
+  output.object[["metaprograms.genes"]] <- markers.genes
+  output.object[["metaprograms.genes.weights"]] <- markers.consensus
   output.object[["metaprograms.metrics"]] <- metaprograms.metrics
-  output.object[["programs.jaccard"]] <- J
+  output.object[["programs.similarity"]] <- J
   output.object[["programs.tree"]] <- tree
   output.object[["programs.clusters"]] <- cl_members.new
   return(output.object)
@@ -232,12 +349,12 @@ getMetaPrograms <- function(nmf.res, method=0.5,
 #' Visualizations for meta-programs
 #'
 #' Generates a clustered heatmap for meta-program similarities (by Jaccard 
-#' index). This function is intended to be run on the object generated by 
-#' \code{\link[GeneNMF]{getMetaPrograms}}, which contains a pre-calculated 
+#' index or Cosine similarity). This function is intended to be run on the object
+#' generated by \code{\link[GeneNMF]{getMetaPrograms}}, which contains a pre-calculated 
 #' tree of pairwise similarities between clusters (as a 'hclust' object).
 #'
 #' @param mp.res The meta-programs object generated by \code{\link{getMetaPrograms}}
-#' @param jaccard.cutoff Min and max values for plotting the Jaccard index
+#' @param similarity.cutoff Min and max values for similarity metric
 #' @param scale Heatmap rescaling (passed to pheatmap as 'scale')
 #' @param palette Heatmap color palette (passed to pheatmap as 'color')
 #' @param annotation_colors Color palette for MP annotations 
@@ -251,7 +368,7 @@ getMetaPrograms <- function(nmf.res, method=0.5,
 #' library(Seurat)
 #' data(sampleObj)
 #' geneNMF_programs <- multiNMF(list(sampleObj), k=5)
-#' geneNMF_metaprograms <- getMetaPrograms(geneNMF_programs, nprograms=3)
+#' geneNMF_metaprograms <- getMetaPrograms(geneNMF_programs, nMP=3)
 #' plotMetaPrograms(geneNMF_metaprograms)
 #' 
 #' @importFrom pheatmap pheatmap
@@ -259,7 +376,7 @@ getMetaPrograms <- function(nmf.res, method=0.5,
 #' @importFrom stats as.dendrogram
 #' @export  
 plotMetaPrograms <- function(mp.res,
-                            jaccard.cutoff=c(0,0.8),
+                            similarity.cutoff=c(0,1),
                             scale = "none",
                             palette = viridis(100, option="A", direction=-1),
                             annotation_colors = NULL,
@@ -268,7 +385,7 @@ plotMetaPrograms <- function(mp.res,
                             show_colnames = FALSE,
                             ...) {
 
-  J <- mp.res[["programs.jaccard"]]
+  J <- mp.res[["programs.similarity"]]
   tree <- mp.res[["programs.tree"]]
   cl_members <- mp.res[["programs.clusters"]]
 
@@ -279,16 +396,16 @@ plotMetaPrograms <- function(mp.res,
   #Recover order of MP clusters
   labs.order <- labels(as.dendrogram(tree))
   cluster.order <- unique(cl_members[labs.order])
-  nprograms <- length(cluster.order)
+  nMP <- length(cluster.order)
   
   #Annotation column
   annotation_col <- as.data.frame(cl_members)
   colnames(annotation_col) <- "Metaprogram"
   annotation_col[["Metaprogram"]] <- factor(cl_members, levels=cluster.order)
 
-  #Apply trimming to Jaccard for plotting  
-  J[J<jaccard.cutoff[1]] <- jaccard.cutoff[1]
-  J[J>jaccard.cutoff[2]] <- jaccard.cutoff[2]
+  #Apply trimming to similarity for plotting  
+  J[J<similarity.cutoff[1]] <- similarity.cutoff[1]
+  J[J>similarity.cutoff[2]] <- similarity.cutoff[2]
   
   ph <- pheatmap(J,
                  scale = scale,
@@ -296,8 +413,8 @@ plotMetaPrograms <- function(mp.res,
                  main = main,
                  cluster_rows = tree,
                  cluster_cols = tree,
-                 cutree_rows = nprograms,
-                 cutree_cols = nprograms,
+                 cutree_rows = nMP,
+                 cutree_cols = nMP,
                  annotation_col = annotation_col,
                  annotation_row = annotation_col,
                  annotation_colors = annotation_colors,
@@ -312,8 +429,9 @@ plotMetaPrograms <- function(mp.res,
 
 #' Run Gene set enrichment analysis
 #'
-#' Utility function to run Gene set enrichment analysis (GSEA) against gene 
-#' sets from MSigDB.
+#' Utility function to run Gene Set Enrichment Analysis (GSEA) against gene 
+#' sets from MSigDB. Note: this is an optional function, which is conditional
+#' to the installation of suggested packages \code{fgsea} and \code{msigdbr}.
 #'
 #' @param genes A vector of genes
 #' @param universe Background universe of gene symbols (passed on to \code{fgsea::fora})
@@ -327,7 +445,13 @@ plotMetaPrograms <- function(mp.res,
 #' @examples
 #' data(sampleObj)
 #' geneset <- c("BANK1","CD22","CD79A","CD19","IGHD","IGHG3","IGHM")
-#' gsea_res <- runGSEA(geneset, universe=rownames(sampleObj), category = "C8")
+#' #test is conditional on availability of suggested packages
+#' if (requireNamespace("fgsea", quietly=TRUE) &
+#'    requireNamespace("msigdbr", quietly=TRUE)) {
+#'    gsea_res <- runGSEA(geneset,
+#'        universe=rownames(sampleObj),
+#'        category = "C8")
+#' }
 #' 
 #' @export  
 runGSEA <- function(genes, universe=NULL,
@@ -369,7 +493,8 @@ runGSEA <- function(genes, universe=NULL,
 #' @param k Number of components for low-dim representation
 #' @param hvg Which genes to use for the reduction
 #' @param new.reduction Name of new dimensionality reduction
-#' @param do_centering Whether to center the data matrix
+#' @param center Whether to center the data matrix
+#' @param scale Whether to scale the data matrix
 #' @param L1 L1 regularization term for NMF
 #' @param seed Random seed
 #' @return Returns a Seurat object with a new dimensionality reduction (NMF)
@@ -378,11 +503,12 @@ runGSEA <- function(genes, universe=NULL,
 #' data(sampleObj)
 #' sampleObj <- runNMF(sampleObj, k=8)
 #' @importFrom RcppML nmf
+#' @importFrom methods new
 #' @export  
 runNMF <- function(obj, assay="RNA", slot="data", k=10,
                    new.reduction="NMF", seed=123,
                    L1=c(0,0), hvg=NULL,
-                   do_centering=TRUE) {
+                   center=FALSE, scale=FALSE) {
   
   
   set.seed(seed)
@@ -395,7 +521,7 @@ runNMF <- function(obj, assay="RNA", slot="data", k=10,
   }
   
   mat <- getDataMatrix(obj=obj, assay=assay, slot=slot,
-                    hvg=hvg, do_centering=do_centering)
+                    hvg=hvg, center=center, scale=scale)
   
   model <- RcppML::nmf(mat, k = k, L1 = L1, verbose=FALSE, seed = seed)
   
@@ -426,7 +552,9 @@ runNMF <- function(obj, assay="RNA", slot="data", k=10,
 #' @param slot Get data matrix from this slot (=layer)
 #' @param hvg List of variable genes to subset the matrix. If NULL, uses
 #'     all genes
-#' @param do_centering Whether to center the data matrix
+#' @param center Whether to center the data matrix
+#' @param scale Whether to scale the data matrix
+#' @param non_negative Enforce non-negative values for NMF
 #'     
 #' @return Returns a sparse data matrix (cells per genes), subset 
 #' according to the given parameters
@@ -436,16 +564,26 @@ runNMF <- function(obj, assay="RNA", slot="data", k=10,
 #' matrix <- getDataMatrix(sampleObj)
 #' 
 #' @importFrom Seurat GetAssayData
+#' @importFrom Matrix t
 #' @export  
-getDataMatrix <- function(obj, assay="RNA", slot="data", hvg=NULL, do_centering=TRUE) {
+getDataMatrix <- function(obj, assay="RNA", slot="data", hvg=NULL,
+                          center=FALSE, scale=FALSE,
+                          non_negative=TRUE) {
   
   mat <- GetAssayData(obj, assay=assay, layer=slot)
   
   #subset on HVG
   if (!is.null(hvg)) mat <- mat[hvg,]
   
-  if (do_centering) {
-    mat <- centerData(mat)
+  #Center and rescale
+  mat <- t(scale(Matrix::t(mat), center=center, scale=scale))
+  
+  #check scaling with rowsum=0 (gives NaN)
+  if (scale) {
+    mat[is.na(mat)] <- 0
+  }
+  if (non_negative) {
+    mat[mat<0] <- 0
   }
   return(mat)
 }

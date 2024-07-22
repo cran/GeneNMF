@@ -6,25 +6,34 @@
 \usage{
 getMetaPrograms(
   nmf.res,
-  method = 0.5,
+  nMP = 10,
+  specificity.weight = 5,
+  weight.explained = 0.5,
   max.genes = 200,
+  metric = c("cosine", "jaccard"),
   hclust.method = "ward.D2",
-  nprograms = 10,
-  min.confidence = 0.2,
+  min.confidence = 0.5,
   remove.empty = TRUE
 )
 }
 \arguments{
 \item{nmf.res}{A list of NMF models obtained from \code{\link{multiNMF}}}
 
-\item{method}{Parameter passed to \code{\link[NMF]{extractFeatures}} to 
-obtain top genes for each program}
+\item{nMP}{Total number of meta-programs}
+
+\item{specificity.weight}{A parameter controlling how specific gene
+should be for each program. `specificity.weight=0` no constraint on
+specificity, and positive values impose increasing specificity.}
+
+\item{weight.explained}{Fraction of NMF weights explained by selected
+genes. For example if weight.explained=0.5, all genes that together
+account for 50\% of NMF weights are used to return program signatures.}
 
 \item{max.genes}{Max number of genes for each programs}
 
-\item{hclust.method}{Method to build similarity tree between individual programs}
+\item{metric}{Metric to calculate pairwise similarity between programs}
 
-\item{nprograms}{Total number of meta-programs}
+\item{hclust.method}{Method to build similarity tree between individual programs}
 
 \item{min.confidence}{Percentage of programs in which a gene is seen 
 (out of programs in the corresponding program tree branch/cluster), to be 
@@ -37,9 +46,9 @@ confidence threshold}
 Returns a list with i) 'metaprograms.genes' top genes for each 
     meta-program; ii) 'metaprograms.metrics' dataframe with meta-programs 
     statistics: a) freq. of samples where the MP is present, b) average 
-    silhouette width, c) mean Jaccard similarity, d) number of genes in MP, 
-    e) number of gene programs in MP; iii) 'programs.jaccard': matrix of 
-    Jaccard similarities between meta-programs; iv) 'programs.tree': 
+    silhouette width, c) mean similarity (cosine or Jaccard), d) number of genes in MP, 
+    e) number of gene programs in MP; iii) 'programs.similarity': matrix of 
+    similarities (Jaccard or cosine) between meta-programs; iv) 'programs.tree': 
     hierarchical clustering of meta-programs (hclust tree); v) 
     'programs.clusters': meta-program identity for each program
 }
@@ -52,6 +61,6 @@ and values of k.
 library(Seurat)
 data(sampleObj)
 geneNMF_programs <- multiNMF(list(sampleObj), k=5)
-geneNMF_metaprograms <- getMetaPrograms(geneNMF_programs, nprograms=3)
+geneNMF_metaprograms <- getMetaPrograms(geneNMF_programs, nMP=3)
 
 }
