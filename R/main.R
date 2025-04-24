@@ -36,6 +36,7 @@
 #' geneNMF_programs <- multiNMF(list(sampleObj), k=5)
 #' 
 #' @importFrom RcppML nmf
+#' @importFrom utils packageVersion
 #' @export  
 multiNMF <- function(obj.list, assay="RNA", slot="data", k=5:6,
                    hvg=NULL, nfeatures = 2000, L1=c(0,0),
@@ -50,9 +51,18 @@ multiNMF <- function(obj.list, assay="RNA", slot="data", k=5:6,
   nc <- lapply(obj.list, ncol)
   obj.list <- obj.list[nc > min.cells.per.sample]
   
-  if (is.null(hvg)) {
+  #check if HVG were manually specified, otherwise calculate
+  if (is.null(hvg) || length(hvg)<=1) {
     hvg <- findHVG(obj.list, nfeatures=nfeatures,
                    min.exp=min.exp, max.exp=max.exp, hvg.blocklist=hvg.blocklist)
+  }
+  #Unit check on k
+  if (!is.numeric(k)) {
+    stop("k must be a numeric vector")
+  }
+  if (sum(k==1) > 0) {
+    warning("k must be a vector of integers larger than 1. Dropping invalid values")
+    k <- k[k>=2]
   }
   
   #run NMF by sample and k
@@ -65,6 +75,7 @@ multiNMF <- function(obj.list, assay="RNA", slot="data", k=5:6,
     res.k <- lapply(k, function(k.this) {
       
       model <- RcppML::nmf(mat, k = k.this, L1 = L1, verbose=FALSE, seed=seed)
+      model <- check_cpp_version(model)
       
       rownames(model$h) <- paste0("pattern",1:nrow(model$h))
       colnames(model$h) <- colnames(mat)
@@ -132,9 +143,17 @@ multiPCA <- function(obj.list, assay="RNA", slot="data", k=4:5,
   nc <- lapply(obj.list, ncol)
   obj.list <- obj.list[nc > min.cells.per.sample]
   
-  if (is.null(hvg)) {
+  if (is.null(hvg) || length(hvg)<=1) {
     hvg <- findHVG(obj.list, nfeatures=nfeatures,
                              min.exp=min.exp, max.exp=max.exp, hvg.blocklist=hvg.blocklist)
+  }
+  #Unit check on k
+  if (!is.numeric(k)) {
+    stop("k must be a numeric vector")
+  }
+  if (sum(k==1) > 0) {
+    warning("k must be a vector of integers larger than 1. Dropping invalid values")
+    k <- k[k>=2]
   }
   
   #run PCA by sample
@@ -244,10 +263,12 @@ getNMFgenes <- function(nmf.res,
 #' @return Returns a list with i) 'metaprograms.genes' top genes for each 
 #'     meta-program; ii) 'metaprograms.metrics' dataframe with meta-programs 
 #'     statistics: a) freq. of samples where the MP is present, b) average 
-#'     silhouette width, c) mean similarity (cosine or Jaccard), d) number of genes in MP, 
-#'     e) number of gene programs in MP; iii) 'programs.similarity': matrix of 
-#'     similarities (Jaccard or cosine) between meta-programs; iv) 'programs.tree': 
-#'     hierarchical clustering of meta-programs (hclust tree); v) 
+#'     silhouette width, c) mean similarity (cosine or Jaccard), d) number of 
+#'     genes in MP, e) number of gene programs in MP; iii) 'metaprogram.composition'
+#'     dataframe containing the number of individual for each sample that
+#'     contributed to the consensus MPs; iv) 'programs.similarity': matrix of 
+#'     similarities (Jaccard or cosine) between meta-programs; v) 'programs.tree': 
+#'     hierarchical clustering of meta-programs (hclust tree); vi) 
 #'     'programs.clusters': meta-program identity for each program
 #'
 #' @examples
@@ -304,10 +325,16 @@ getMetaPrograms <- function(nmf.res,
                                                   markers.consensus=markers.consensus,
                                                   cl_members=cl_members)
   
+  #Get meta-program composition
+  metaprograms.composition <- get_metaprogram_composition(J=J,
+                                                  markers.consensus=markers.consensus,
+                                                  cl_members=cl_members)
+  
   #Remove any empty meta-program
   if (remove.empty) {
     keep <- metaprograms.metrics$numberGenes > 0
     metaprograms.metrics <- metaprograms.metrics[keep,]
+    metaprograms.composition <- metaprograms.composition[keep,]
     markers.consensus <- markers.consensus[keep]
     if (sum(!keep)>0) {
       message(sprintf("Dropped %i empty meta-programs", sum(!keep)))
@@ -323,8 +350,12 @@ getMetaPrograms <- function(nmf.res,
   
   markers.consensus <- markers.consensus[ord]
   names(markers.consensus) <- new.names
+  
+  #Reorder metrics and composition tables
   metaprograms.metrics <- metaprograms.metrics[ord,]
   rownames(metaprograms.metrics) <- new.names
+  metaprograms.composition <- metaprograms.composition[ord,]
+  rownames(metaprograms.composition) <- new.names
   
   map.index <- seq_along(old.names)
   names(map.index) <- as.numeric(gsub("MetaProgram","",old.names))
@@ -340,6 +371,7 @@ getMetaPrograms <- function(nmf.res,
   output.object[["metaprograms.genes"]] <- markers.genes
   output.object[["metaprograms.genes.weights"]] <- markers.consensus
   output.object[["metaprograms.metrics"]] <- metaprograms.metrics
+  output.object[["metaprograms.composition"]] <- metaprograms.composition
   output.object[["programs.similarity"]] <- J
   output.object[["programs.tree"]] <- tree
   output.object[["programs.clusters"]] <- cl_members.new
@@ -466,6 +498,9 @@ plotMetaPrograms <- function(mp.res,
 #' @param subcategory GSEA subcategory
 #' @param species Species for GSEA analysis. For a list of the available species,
 #'     type \code{msigdbr::msigdbr_species()}
+#' @param custom.db A custom database of signatures, to be used instead of MSigDB. 
+#'     Provide custom.db as a named list, where the list names are the signature 
+#'     names, and the list elements are the signatures (as vectors).
 #' @param pval.thr Min p-value to include results
 #' @return Returns a table of enriched gene programs from GSEA
 #'
@@ -484,6 +519,7 @@ plotMetaPrograms <- function(mp.res,
 runGSEA <- function(genes, universe=NULL,
                     category="H", subcategory=NULL,
                     species="Homo sapiens",
+                    custom.db=NULL,
                     pval.thr=0.05) {
   
   
@@ -497,10 +533,17 @@ runGSEA <- function(genes, universe=NULL,
     genes <- genes[!duplicated(genes)]
   }
   
-  msig_df <- msigdbr::msigdbr(species = species, category = category, subcategory=subcategory)
-  msig_list <- split(x=msig_df$gene_symbol, f=msig_df$gs_name)
+  if (!is.null(custom.db)) {
+    #check format: should be a named list of signatures
+    if (!is.list(custom.db) || is.null(names(custom.db))) 
+      stop("custom.db should be a named list", call. = FALSE)
+    DB_list <- custom.db
+  } else {  # use signatures from mSigDB
+    msig_df <- msigdbr::msigdbr(species = species, category = category, subcategory=subcategory)
+    DB_list <- split(x=msig_df$gene_symbol, f=msig_df$gs_name)
+  }
   
-  fgRes <- fgsea::fora(pathways = msig_list,
+  fgRes <- fgsea::fora(pathways = DB_list,
                        genes = genes,
                        universe = universe)
   
@@ -531,6 +574,7 @@ runGSEA <- function(genes, universe=NULL,
 #' sampleObj <- runNMF(sampleObj, k=8)
 #' @importFrom RcppML nmf
 #' @importFrom methods new
+#' @importFrom utils packageVersion
 #' @export  
 runNMF <- function(obj, assay="RNA", slot="data", k=10,
                    new.reduction="NMF", seed=123,
@@ -540,7 +584,7 @@ runNMF <- function(obj, assay="RNA", slot="data", k=10,
   
   set.seed(seed)
   
-  if (is.null(hvg)) {
+  if (is.null(hvg) || length(hvg)<=1) {
     hvg <- VariableFeatures(obj, assay=assay)
   }
   if (is.null(hvg) | length(hvg)==0) {
@@ -549,9 +593,10 @@ runNMF <- function(obj, assay="RNA", slot="data", k=10,
   
   mat <- getDataMatrix(obj=obj, assay=assay, slot=slot,
                     hvg=hvg, center=center, scale=scale)
-  
+
   model <- RcppML::nmf(mat, k = k, L1 = L1, verbose=FALSE, seed = seed)
-  
+  model <- check_cpp_version(model)
+
   rownames(model$h) <- paste0(new.reduction,"_",1:nrow(model$h))
   colnames(model$h) <- colnames(mat)
   

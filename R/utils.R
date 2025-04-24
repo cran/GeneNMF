@@ -94,8 +94,13 @@ get_metaprogram_consensus <- function(nmf.wgt,
     
     genes.avg <- apply(as.matrix(gene.table), 1, function(x){
       mean <- mean(x)
-      sd <- sd(x)
-      x.out <- x[x>mean-2*sd & x<mean+2*sd]  #remove outliers
+      if (length(x) >=3) { #remove outliers (SD only with 3 or more points)
+        sd <- sd(x)
+        x.out <- x[x>mean-2*sd & x<mean+2*sd]  
+      } else {
+        x.out <- mean
+      }
+      
       mean(x.out)
     })
     genes.avg <- sort(genes.avg, decreasing = T)
@@ -167,6 +172,23 @@ get_metaprogram_metrics <- function(J=NULL, Jdist=NULL,
   return(metaprograms.metrics)
 }
 
+#In which samples was a MP detected?
+get_metaprogram_composition <- function(J=NULL,
+                                    markers.consensus=NULL,
+                                    cl_members=NULL) {
+  nMP <- length(markers.consensus)
+  all.samples <- unique(gsub("\\.k\\d+\\.\\d+","",colnames(J)))
+  sample.comp <- lapply(seq(1, nMP), function(c) {
+    which.samples <- names(cl_members)[cl_members == c]
+    ss <- gsub("\\.k\\d+\\.\\d+","",which.samples)
+    ss <- factor(ss, levels=all.samples)
+    table(ss)
+  })
+  names(sample.comp) <- paste0("MetaProgram",seq(1,nMP))
+  composition <- do.call(rbind, sample.comp)
+  return(composition)
+}
+
 #Split positive and negative components of PCA, and reorder by variance
 nonNegativePCA <- function(pca, k) {
   
@@ -226,4 +248,16 @@ weightCumul <- function(vector, weight.explained=0.5) {
     norm.cs <- normVector(cs)
     norm.cs <- norm.cs/max(norm.cs)
     x.sorted[norm.cs<weight.explained]
+}
+
+check_cpp_version <- function(model) {
+  cppversion <- packageVersion("RcppML")
+  if(cppversion >= "0.5.6"){
+    model<-list(w=model@w, 
+                d=model@d, 
+                h=model@h, 
+                tol=model@misc$tol,
+                iter=model@misc$iter)
+  }
+  return(model)
 }
